@@ -1,0 +1,758 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
+import html2canvas from 'html2canvas';
+
+const TEAM_COLORS = {
+  A: '#2dd4bf',
+  B: '#f59e0b'
+};
+
+const defaultPlayers = [
+  { number: 1, name: 'Fullback', position: 'Fullback' },
+  { number: 2, name: 'Wing', position: 'Wing' },
+  { number: 3, name: 'Centre', position: 'Centre' },
+  { number: 4, name: 'Centre', position: 'Centre' },
+  { number: 5, name: 'Wing', position: 'Wing' },
+  { number: 6, name: 'Five-Eighth', position: 'Five-Eighth' },
+  { number: 7, name: 'Halfback', position: 'Halfback' },
+  { number: 8, name: 'Prop', position: 'Prop' },
+  { number: 9, name: 'Hooker', position: 'Hooker' },
+  { number: 10, name: 'Prop', position: 'Prop' },
+  { number: 11, name: 'Second Row', position: 'Second Row' },
+  { number: 12, name: 'Second Row', position: 'Second Row' },
+  { number: 13, name: 'Lock', position: 'Lock' },
+  { number: 14, name: 'Interchange', position: 'Interchange' },
+  { number: 15, name: 'Interchange', position: 'Interchange' },
+  { number: 16, name: 'Interchange', position: 'Interchange' },
+  { number: 17, name: 'Interchange', position: 'Interchange' }
+];
+
+const formationMap = [
+  { x: 10, y: 50 },
+  { x: 18, y: 18 },
+  { x: 25, y: 35 },
+  { x: 25, y: 65 },
+  { x: 18, y: 82 },
+  { x: 34, y: 50 },
+  { x: 41, y: 68 },
+  { x: 52, y: 20 },
+  { x: 62, y: 52 },
+  { x: 52, y: 80 },
+  { x: 70, y: 26 },
+  { x: 70, y: 74 },
+  { x: 80, y: 50 },
+  { x: 86, y: 18 },
+  { x: 86, y: 40 },
+  { x: 86, y: 60 },
+  { x: 86, y: 82 }
+];
+
+const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+const createTeamFromSource = (side, players, customNumbers = []) => {
+  return defaultPlayers.map((player, index) => {
+    const uploaded = players[index] ?? customNumbers.find((item) => Number(item.number) === player.number) ?? {};
+    const number = uploaded.number ?? player.number;
+    const name = uploaded.name ?? player.name;
+    const position = uploaded.position ?? player.position;
+
+    return {
+      id: `${side}-${number}`,
+      team: side,
+      number: Number(number),
+      name,
+      position,
+      x: uploaded.x ?? formationMap[index]?.x ?? 50,
+      y: uploaded.y ?? formationMap[index]?.y ?? 50
+    };
+  });
+};
+
+const buildDefaultTeam = (side) => createTeamFromSource(side, []);
+
+const getRelativeFieldPoint = (event, fieldRef) => {
+  const rect = fieldRef.current?.getBoundingClientRect();
+  if (!rect) return { x: 50, y: 50 };
+
+  const x = ((event.clientX - rect.left) / rect.width) * 100;
+  const y = ((event.clientY - rect.top) / rect.height) * 100;
+
+  return {
+    x: clamp(x, 3, 97),
+    y: clamp(y, 6, 94)
+  };
+};
+
+const calculateDistance = (a, b) => {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+};
+
+const distanceToNearestTeamMate = (players, selectedPlayer) => {
+  if (!players || !selectedPlayer) return 0;
+
+  const others = players.filter((player) => player.id !== selectedPlayer.id);
+  if (!others.length) return 0;
+
+  return Math.min(...others.map((player) => calculateDistance(selectedPlayer, player)));
+};
+
+const formatMetric = (value) => `${value.toFixed(1)}m`;
+
+const loadScenarios = () => {
+  try {
+    const raw = localStorage.getItem('nrl-scenarios');
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+};
+
+const parseUploadedPlayers = (rows = []) => {
+  return rows
+    .map((row) => {
+      const number =
+        row['Jersey Number'] ??
+        row['JerseyNumber'] ??
+        row['Number'] ??
+        row['Player Number'] ??
+        row['jersey number'] ??
+        row['number'];
+
+      const name =
+        row['Player Name'] ??
+        row['Name'] ??
+        row['Player'] ??
+        row['Player Name '] ??
+        row['player name'];
+
+      const position =
+        row['Position'] ??
+        row['Role'] ??
+        row['position'] ??
+        row['Position '] ??
+        row['position name'];
+
+      return {
+        number: Number(number),
+        name: String(name ?? '').trim(),
+        position: String(position ?? '').trim()
+      };
+    })
+    .filter((row) => Number.isFinite(row.number) && row.name);
+};
+
+const makeScenarioState = (name, teamA, teamB, drawings) => ({
+  id: crypto.randomUUID(),
+  name,
+  teamA,
+  teamB,
+  drawings
+});
+
+function App() {
+  const fieldRef = useRef(null);
+  const [teamA, setTeamA] = useState(() => buildDefaultTeam('A'));
+  const [teamB, setTeamB] = useState(() => buildDefaultTeam('B'));
+  const [selectedSide, setSelectedSide] = useState('A');
+  const [selectedPlayerId, setSelectedPlayerId] = useState('A-1');
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [activeTool, setActiveTool] = useState('select');
+  const [draftLine, setDraftLine] = useState(null);
+  const [drawings, setDrawings] = useState([]);
+  const [scenarioName, setScenarioName] = useState('Scenario 1');
+  const [scenarioList, setScenarioList] = useState(() => loadScenarios());
+  const [manualEntry, setManualEntry] = useState({ A: { number: '', name: '', position: '' }, B: { number: '', name: '', position: '' } });
+  const [isDraggingField, setIsDraggingField] = useState(false);
+  const [fieldDragStart, setFieldDragStart] = useState(null);
+
+  const currentTeam = selectedSide === 'A' ? teamA : teamB;
+  const selectedPlayer = useMemo(
+    () => currentTeam.find((player) => player.id === selectedPlayerId) ?? currentTeam[0],
+    [currentTeam, selectedPlayerId]
+  );
+
+  useEffect(() => {
+    if (!selectedPlayer && currentTeam.length) {
+      setSelectedPlayerId(currentTeam[0].id);
+    }
+  }, [currentTeam, selectedPlayer]);
+
+  const updateTeam = (side, updater) => {
+    if (side === 'A') {
+      setTeamA((current) => updater(current));
+      return;
+    }
+
+    setTeamB((current) => updater(current));
+  };
+
+  const setPlayerPosition = (side, playerId, x, y) => {
+    updateTeam(side, (players) =>
+      players.map((player) =>
+        player.id === playerId ? { ...player, x: clamp(x, 3, 97), y: clamp(y, 6, 94) } : player
+      )
+    );
+  };
+
+  const importPlayers = (side, file) => {
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const workbook = XLSX.read(event.target.result, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const jsonRows = XLSX.utils.sheet_to_json(firstSheet, { defval: '', raw: false });
+      const parsedRows = parseUploadedPlayers(jsonRows);
+
+      if (!parsedRows.length) {
+        return;
+      }
+
+      const nextPlayers = parsedRows.slice(0, 17).map((row, index) => {
+        const target = defaultPlayers[index] ?? { number: index + 1, name: `Player ${index + 1}`, position: 'Bench' };
+        return {
+          id: `${side}-${row.number || target.number}`,
+          team: side,
+          number: Number(row.number || target.number),
+          name: row.name || target.name,
+          position: row.position || target.position,
+          x: formationMap[index]?.x ?? 50,
+          y: formationMap[index]?.y ?? 50
+        };
+      });
+
+      if (side === 'A') {
+        setTeamA(nextPlayers);
+      } else {
+        setTeamB(nextPlayers);
+      }
+    };
+
+    reader.readAsArrayBuffer(file);
+  };
+
+  const addManualEntry = (side) => {
+    const value = manualEntry[side];
+    const parsedNumber = Number(value.number);
+
+    if (!value.name || !Number.isFinite(parsedNumber)) {
+      return;
+    }
+
+    const nextPlayer = {
+      id: `${side}-${parsedNumber}`,
+      team: side,
+      number: parsedNumber,
+      name: value.name,
+      position: value.position || 'Tactical',
+      x: formationMap[(side === 'A' ? teamA.length : teamB.length) % formationMap.length]?.x ?? 50,
+      y: formationMap[(side === 'A' ? teamA.length : teamB.length) % formationMap.length]?.y ?? 50
+    };
+
+    if (side === 'A') {
+      setTeamA((players) => {
+        const existing = players.findIndex((player) => player.number === parsedNumber);
+        if (existing >= 0) {
+          const updated = [...players];
+          updated[existing] = nextPlayer;
+          return updated;
+        }
+        return [...players, nextPlayer].sort((a, b) => a.number - b.number).slice(0, 17);
+      });
+    } else {
+      setTeamB((players) => {
+        const existing = players.findIndex((player) => player.number === parsedNumber);
+        if (existing >= 0) {
+          const updated = [...players];
+          updated[existing] = nextPlayer;
+          return updated;
+        }
+        return [...players, nextPlayer].sort((a, b) => a.number - b.number).slice(0, 17);
+      });
+    }
+
+    setManualEntry((current) => ({
+      ...current,
+      [side]: { number: '', name: '', position: '' }
+    }));
+  };
+
+  const handleFieldPointerDown = (event) => {
+    if (activeTool === 'pan') {
+      setIsDraggingField(true);
+      setFieldDragStart({ x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y });
+      return;
+    }
+
+    if (activeTool === 'line' || activeTool === 'arrow' || activeTool === 'annotation') {
+      const point = getRelativeFieldPoint(event, fieldRef);
+
+      if (activeTool === 'annotation') {
+        const label = window.prompt('Enter note label', 'Defensive check');
+        if (!label) return;
+        setDrawings((current) => [...current, { type: 'annotation', label, x: point.x, y: point.y }]);
+        return;
+      }
+
+      if (!draftLine) {
+        setDraftLine({ start: point });
+        return;
+      }
+
+      const start = draftLine.start;
+      const end = point;
+      setDrawings((current) => [
+        ...current,
+        {
+          type: activeTool,
+          start,
+          end,
+          color: activeTool === 'line' ? '#e2e8f0' : '#fbbf24'
+        }
+      ]);
+      setDraftLine(null);
+    }
+  };
+
+  const handleFieldPointerMove = (event) => {
+    if (!isDraggingField || !fieldDragStart) return;
+
+    const dx = event.clientX - fieldDragStart.x;
+    const dy = event.clientY - fieldDragStart.y;
+
+    setPan({
+      x: fieldDragStart.panX + dx,
+      y: fieldDragStart.panY + dy
+    });
+  };
+
+  const handleFieldPointerUp = () => {
+    setIsDraggingField(false);
+    setFieldDragStart(null);
+  };
+
+  const handleWheel = (event) => {
+    event.preventDefault();
+    const nextZoom = clamp(zoom + (event.deltaY > 0 ? -0.08 : 0.08), 0.7, 1.8);
+    setZoom(nextZoom);
+  };
+
+  const handleMarkerDrag = (side, playerId, event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const player = (side === 'A' ? teamA : teamB).find((entry) => entry.id === playerId);
+    if (!player) return;
+
+    setSelectedSide(side);
+    setSelectedPlayerId(playerId);
+
+    const fieldRect = fieldRef.current?.getBoundingClientRect();
+    if (!fieldRect) return;
+
+    const moveHandler = (moveEvent) => {
+      const nextPoint = getRelativeFieldPoint(moveEvent, fieldRef);
+      setPlayerPosition(side, playerId, nextPoint.x, nextPoint.y);
+    };
+
+    const endHandler = () => {
+      window.removeEventListener('pointermove', moveHandler);
+      window.removeEventListener('pointerup', endHandler);
+    };
+
+    window.addEventListener('pointermove', moveHandler);
+    window.addEventListener('pointerup', endHandler);
+  };
+
+  const teamDepth = (players) => {
+    if (!players.length) return 0;
+    return Math.max(...players.map((player) => player.x)) - Math.min(...players.map((player) => player.x));
+  };
+
+  const edgeSpacing = (players) => {
+    if (players.length < 2) return 0;
+    const edgePlayers = players.filter((player) => player.x < 35 || player.x > 65).sort((a, b) => a.x - b.x);
+    const values = edgePlayers.slice(1).map((player, index) => Math.abs(player.x - edgePlayers[index].x));
+    return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  };
+
+  const middleSpacing = (players) => {
+    if (players.length < 2) return 0;
+    const middlePlayers = players.filter((player) => player.x >= 35 && player.x <= 65).sort((a, b) => a.x - b.x);
+    const values = middlePlayers.slice(1).map((player, index) => Math.abs(player.x - middlePlayers[index].x));
+    return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  };
+
+  const selectedTeamPlayers = selectedSide === 'A' ? teamA : teamB;
+  const selectedMetrics = useMemo(() => {
+    const defender = selectedPlayer ?? selectedTeamPlayers[0];
+    const nearest = distanceToNearestTeamMate(selectedTeamPlayers, defender);
+
+    return {
+      selected: defender,
+      nearest: nearest,
+      depth: teamDepth(selectedTeamPlayers),
+      edge: edgeSpacing(selectedTeamPlayers),
+      middle: middleSpacing(selectedTeamPlayers)
+    };
+  }, [selectedPlayer, selectedTeamPlayers]);
+
+  const resetFormation = () => {
+    const nextA = buildDefaultTeam('A');
+    const nextB = buildDefaultTeam('B');
+    setTeamA(nextA);
+    setTeamB(nextB);
+    setSelectedSide('A');
+    setSelectedPlayerId('A-1');
+  };
+
+  const saveScenario = () => {
+    const nextScenario = makeScenarioState(
+      scenarioName.trim() || `Scenario ${scenarioList.length + 1}`,
+      teamA,
+      teamB,
+      drawings
+    );
+
+    const updated = [...scenarioList, nextScenario];
+    setScenarioList(updated);
+    localStorage.setItem('nrl-scenarios', JSON.stringify(updated));
+  };
+
+  const loadScenario = (scenario) => {
+    setTeamA(scenario.teamA);
+    setTeamB(scenario.teamB);
+    setDrawings(scenario.drawings || []);
+    setScenarioName(scenario.name);
+    setSelectedSide('A');
+    setSelectedPlayerId('A-1');
+  };
+
+  const duplicateScenario = (scenario) => {
+    const duplicate = makeScenarioState(`${scenario.name} copy`, scenario.teamA, scenario.teamB, scenario.drawings || []);
+    const updated = [...scenarioList, duplicate];
+    setScenarioList(updated);
+    localStorage.setItem('nrl-scenarios', JSON.stringify(updated));
+  };
+
+  const exportScreenshot = async () => {
+    const fieldCanvas = document.querySelector('.field-capture');
+    if (!fieldCanvas) return;
+
+    const canvas = await html2canvas(fieldCanvas, { backgroundColor: '#020817' });
+    const link = document.createElement('a');
+    link.download = `${scenarioName || 'nrl-defensive-scenario'}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  };
+
+  const shareScenario = async () => {
+    const payload = JSON.stringify({
+      name: scenarioName,
+      teamA,
+      teamB,
+      drawings
+    });
+
+    try {
+      await navigator.clipboard.writeText(payload);
+    } catch {
+      window.prompt('Copy scenario JSON', payload);
+    }
+  };
+
+  const renderTeamList = (side, players, label) => (
+    <div className="roster-panel">
+      <div className="panel-header">
+        <div>
+          <span className="eyebrow">{label}</span>
+          <h3>Team {side}</h3>
+        </div>
+        <button className="ghost-button" onClick={() => setSelectedSide(side)}>
+          Focus
+        </button>
+      </div>
+
+      <div className="upload-row">
+        <input
+          type="file"
+          accept=".csv,.xlsx,.xls"
+          onChange={(event) => importPlayers(side, event.target.files?.[0])}
+        />
+      </div>
+
+      <div className="manual-entry">
+        <input
+          type="number"
+          min="1"
+          max="17"
+          placeholder="Jersey"
+          value={manualEntry[side].number}
+          onChange={(event) =>
+            setManualEntry((current) => ({
+              ...current,
+              [side]: { ...current[side], number: event.target.value }
+            }))
+          }
+        />
+        <input
+          type="text"
+          placeholder="Player name"
+          value={manualEntry[side].name}
+          onChange={(event) =>
+            setManualEntry((current) => ({
+              ...current,
+              [side]: { ...current[side], name: event.target.value }
+            }))
+          }
+        />
+        <input
+          type="text"
+          placeholder="Position"
+          value={manualEntry[side].position}
+          onChange={(event) =>
+            setManualEntry((current) => ({
+              ...current,
+              [side]: { ...current[side], position: event.target.value }
+            }))
+          }
+        />
+        <button onClick={() => addManualEntry(side)}>Add</button>
+      </div>
+
+      <div className="roster-list">
+        {players.map((player) => (
+          <button
+            key={player.id}
+            className={`roster-item ${selectedPlayerId === player.id ? 'active' : ''}`}
+            onClick={() => {
+              setSelectedSide(side);
+              setSelectedPlayerId(player.id);
+            }}
+          >
+            <span className="player-number">#{player.number}</span>
+            <span className="player-name">{player.name}</span>
+            <span className="player-role">{player.position}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="app-shell">
+      <aside className="side-panel left-panel">
+        {renderTeamList('A', teamA, 'Team A')}
+      </aside>
+
+      <main className="center-panel">
+        <header className="toolbar">
+          <div className="tool-group">
+            <button className={activeTool === 'select' ? 'active' : ''} onClick={() => setActiveTool('select')}>
+              Move
+            </button>
+            <button className={activeTool === 'line' ? 'active' : ''} onClick={() => setActiveTool('line')}>
+              Line
+            </button>
+            <button className={activeTool === 'arrow' ? 'active' : ''} onClick={() => setActiveTool('arrow')}>
+              Arrow
+            </button>
+            <button className={activeTool === 'annotation' ? 'active' : ''} onClick={() => setActiveTool('annotation')}>
+              Note
+            </button>
+            <button className={activeTool === 'pan' ? 'active' : ''} onClick={() => setActiveTool('pan')}>
+              Pan
+            </button>
+          </div>
+
+          <div className="tool-group right-actions">
+            <button onClick={() => setZoom((current) => clamp(current - 0.1, 0.7, 1.8))}>-</button>
+            <button onClick={() => setZoom((current) => clamp(current + 0.1, 0.7, 1.8))}>+</button>
+            <button onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Reset View</button>
+            <button onClick={resetFormation}>Reset Line</button>
+          </div>
+        </header>
+
+        <div
+          className="field-capture"
+          onPointerDown={handleFieldPointerDown}
+          onPointerMove={handleFieldPointerMove}
+          onPointerUp={handleFieldPointerUp}
+          onPointerLeave={handleFieldPointerUp}
+          onWheel={handleWheel}
+        >
+          <div
+            className="field-inner"
+            style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+            ref={fieldRef}
+          >
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="field-graphic" role="img" aria-label="NRL Playing Field">
+              <rect x="0" y="0" width="100" height="100" fill="#0f766e" opacity="0.22" />
+              <rect x="2" y="2" width="96" height="96" fill="none" stroke="#dfe9f6" strokeWidth="0.8" />
+              <line x1="50" y1="2" x2="50" y2="98" stroke="#dfe9f6" strokeWidth="0.9" />
+              <line x1="2" y1="50" x2="98" y2="50" stroke="#dfe9f6" strokeWidth="0.6" opacity="0.8" />
+              <rect x="15" y="8" width="70" height="84" fill="none" stroke="#dfe9f6" strokeWidth="0.9" />
+              <rect x="20" y="15" width="60" height="70" fill="none" stroke="#dfe9f6" strokeWidth="0.8" />
+              <circle cx="50" cy="50" r="9" fill="none" stroke="#dfe9f6" strokeWidth="0.7" />
+              <line x1="50" y1="8" x2="50" y2="92" stroke="#dfe9f6" strokeWidth="0.6" opacity="0.7" />
+              <rect x="2" y="35" width="8" height="30" fill="none" stroke="#dfe9f6" strokeWidth="0.8" />
+              <rect x="90" y="35" width="8" height="30" fill="none" stroke="#dfe9f6" strokeWidth="0.8" />
+              <circle cx="50" cy="50" r="1.5" fill="#dfe9f6" />
+              <line x1="5" y1="20" x2="5" y2="80" stroke="#dfe9f6" strokeWidth="0.5" opacity="0.7" />
+              <line x1="95" y1="20" x2="95" y2="80" stroke="#dfe9f6" strokeWidth="0.5" opacity="0.7" />
+            </svg>
+
+            {drawings.map((drawing, index) => {
+              if (drawing.type === 'line' || drawing.type === 'arrow') {
+                const dx = drawing.end.x - drawing.start.x;
+                const dy = drawing.end.y - drawing.start.y;
+                const angle = Math.atan2(dy, dx);
+                const headLength = 3;
+                const leftAngle = angle - Math.PI / 6;
+                const rightAngle = angle + Math.PI / 6;
+                const arrowEndX = drawing.end.x;
+                const arrowEndY = drawing.end.y;
+                const arrowLeftX = arrowEndX - headLength * Math.cos(leftAngle);
+                const arrowLeftY = arrowEndY - headLength * Math.sin(leftAngle);
+                const arrowRightX = arrowEndX - headLength * Math.cos(rightAngle);
+                const arrowRightY = arrowEndY - headLength * Math.sin(rightAngle);
+
+                return (
+                  <svg key={`${drawing.type}-${index}`} className="drawing-layer" viewBox="0 0 100 100" preserveAspectRatio="none">
+                    <line x1={drawing.start.x} y1={drawing.start.y} x2={drawing.end.x} y2={drawing.end.y} stroke={drawing.color} strokeWidth="0.7" strokeDasharray="1.5 1.5" />
+                    {drawing.type === 'arrow' && (
+                      <>
+                        <line x1={arrowEndX} y1={arrowEndY} x2={arrowLeftX} y2={arrowLeftY} stroke={drawing.color} strokeWidth="0.7" />
+                        <line x1={arrowEndX} y1={arrowEndY} x2={arrowRightX} y2={arrowRightY} stroke={drawing.color} strokeWidth="0.7" />
+                      </>
+                    )}
+                  </svg>
+                );
+              }
+
+              if (drawing.type === 'annotation') {
+                return (
+                  <div key={`note-${index}`} className="annotation-tag" style={{ left: `${drawing.x}%`, top: `${drawing.y}%` }}>
+                    {drawing.label}
+                  </div>
+                );
+              }
+
+              return null;
+            })}
+
+            {draftLine && (
+              <svg className="drawing-layer" viewBox="0 0 100 100" preserveAspectRatio="none">
+                <line x1={draftLine.start.x} y1={draftLine.start.y} x2={draftLine.start.x} y2={draftLine.start.y} stroke="#e2e8f0" strokeWidth="0.75" strokeDasharray="1.5 1.5" />
+              </svg>
+            )}
+
+            {teamA.map((player) => (
+              <button
+                key={player.id}
+                className={`player-marker team-a ${selectedPlayerId === player.id ? 'selected' : ''}`}
+                style={{ left: `${player.x}%`, top: `${player.y}%` }}
+                onPointerDown={(event) => handleMarkerDrag('A', player.id, event)}
+                onClick={() => {
+                  setSelectedSide('A');
+                  setSelectedPlayerId(player.id);
+                }}
+                title={`${player.name} #${player.number}`}
+              >
+                {player.number}
+              </button>
+            ))}
+
+            {teamB.map((player) => (
+              <button
+                key={player.id}
+                className={`player-marker team-b ${selectedPlayerId === player.id ? 'selected' : ''}`}
+                style={{ left: `${player.x}%`, top: `${player.y}%` }}
+                onPointerDown={(event) => handleMarkerDrag('B', player.id, event)}
+                onClick={() => {
+                  setSelectedSide('B');
+                  setSelectedPlayerId(player.id);
+                }}
+                title={`${player.name} #${player.number}`}
+              >
+                {player.number}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="analysis-summary">
+          <div className="metric-card">
+            <span>Selected player</span>
+            <strong>
+              {selectedMetrics.selected?.name || 'N/A'} #{selectedMetrics.selected?.number || '---'}
+            </strong>
+          </div>
+          <div className="metric-card">
+            <span>Coords</span>
+            <strong>
+              {selectedMetrics.selected?.x.toFixed(1) || '0.0'}, {selectedMetrics.selected?.y.toFixed(1) || '0.0'}
+            </strong>
+          </div>
+          <div className="metric-card">
+            <span>Distance</span>
+            <strong>{formatMetric(selectedMetrics.nearest)}</strong>
+          </div>
+          <div className="metric-card">
+            <span>Defensive line depth</span>
+            <strong>{formatMetric(selectedMetrics.depth)}</strong>
+          </div>
+          <div className="metric-card">
+            <span>Edge spacing</span>
+            <strong>{formatMetric(selectedMetrics.edge)}</strong>
+          </div>
+          <div className="metric-card">
+            <span>Middle spacing</span>
+            <strong>{formatMetric(selectedMetrics.middle)}</strong>
+          </div>
+        </div>
+      </main>
+
+      <aside className="side-panel right-panel">
+        {renderTeamList('B', teamB, 'Team B')}
+
+        <div className="scenario-panel">
+          <div className="panel-header">
+            <div>
+              <span className="eyebrow">Scenario</span>
+              <h3>Management</h3>
+            </div>
+          </div>
+
+          <div className="scenario-controls">
+            <input
+              type="text"
+              value={scenarioName}
+              onChange={(event) => setScenarioName(event.target.value)}
+              placeholder="Scenario name"
+            />
+            <button onClick={saveScenario}>Save</button>
+            <button onClick={shareScenario}>Share</button>
+            <button onClick={exportScreenshot}>Export PNG</button>
+          </div>
+
+          <div className="scenario-list">
+            {scenarioList.map((scenario) => (
+              <div key={scenario.id} className="scenario-item">
+                <span>{scenario.name}</span>
+                <div>
+                  <button onClick={() => loadScenario(scenario)}>Load</button>
+                  <button onClick={() => duplicateScenario(scenario)}>Copy</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+export default App;
